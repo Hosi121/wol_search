@@ -4,10 +4,6 @@ from bs4 import BeautifulSoup
 import urllib.parse
 import pandas as pd
 import time
-import io
-import gspread
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 # ページ設定
 st.set_page_config(
@@ -74,13 +70,6 @@ st.markdown("""
     .sidebar-header {
         margin-bottom: 30px;
     }
-    .google-sheet-section {
-        background-color: #f0f7ff;
-        border-radius: 10px;
-        padding: 15px;
-        margin-top: 20px;
-        border-left: 5px solid #4285F4;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -97,6 +86,7 @@ def get_base_url(lang):
         "ja": "https://wol.jw.org/ja/wol/s/r7/lp-j",
         "en": "https://wol.jw.org/en/wol/s/r1/lp-e"
     }
+    # 指定された言語が無い場合は日本語版を返す
     return urls.get(lang, urls["ja"])
 
 # ------------------------------
@@ -135,6 +125,7 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
                 link_tag = caption_li.select_one("a.lnk")
                 if link_tag:
                     title = link_tag.get_text(strip=True)
+                    # 相対パスを絶対URLに変換
                     link = urllib.parse.urljoin(base_url, link_tag.get("href", "").strip())
                 else:
                     title, link = "", ""
@@ -163,7 +154,7 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
             else:
                 title, link, snippet, publication = "", "", "", ""
             
-            if title and link:
+            if title and link:  # 有効な結果のみ追加
                 items.append({
                     "title": title,
                     "link": link,
@@ -171,7 +162,7 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
                     "publication": publication
                 })
         
-        # ページネーション情報の取得
+        # ページネーション情報の取得（該当要素が無ければ次ページ無しと判断）
         try:
             total_str = soup.select_one("#searchResultsTotal")["value"]
             page_size_str = soup.select_one("#searchResultsPageSize")["value"]
@@ -201,76 +192,6 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
         return {"items": [], "has_next": False, "result_info": {"total": 0, "current_page": 1, "total_pages": 1}}
 
 # ------------------------------
-# Google Sheets 連携機能（オプション）
-# ------------------------------
-def connect_to_google_sheets(json_key_content):
-    """
-    Google SheetsへのAPI接続
-    """
-    try:
-        credentials = service_account.Credentials.from_service_account_info(
-            json_key_content,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-        )
-        gc = gspread.authorize(credentials)
-        sheets_api = build('sheets', 'v4', credentials=credentials)
-        return gc, sheets_api
-    except Exception as e:
-        st.error(f"Google Sheetsへの接続に失敗しました: {str(e)}")
-        return None, None
-
-def get_or_create_sheet(gc, sheet_name, worksheet_name=None):
-    """
-    指定したシートを取得または新規作成
-    """
-    try:
-        try:
-            sh = gc.open(sheet_name)
-        except gspread.exceptions.SpreadsheetNotFound:
-            sh = gc.create(sheet_name)
-            sh.share(gc.auth.service_account_email, role='writer', perm_type='user')
-        
-        if worksheet_name:
-            try:
-                worksheet = sh.worksheet(worksheet_name)
-            except gspread.exceptions.WorksheetNotFound:
-                worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
-        else:
-            worksheet = sh.sheet1
-        
-        return sh, worksheet
-    except Exception as e:
-        st.error(f"シートの取得または作成に失敗しました: {str(e)}")
-        return None, None
-
-def export_to_google_sheets(gc, data, sheet_name, worksheet_name=None):
-    """
-    検索結果をGoogle Sheetsにエクスポート
-    """
-    try:
-        sh, worksheet = get_or_create_sheet(gc, sheet_name, worksheet_name)
-        if not sh or not worksheet:
-            return False, "シートの準備に失敗しました"
-        
-        df = pd.DataFrame(data)
-        headers = df.columns.tolist()
-        values = [headers] + df.values.tolist()
-        
-        worksheet.clear()
-        worksheet.update(values)
-        worksheet.format('A1:Z1', {
-            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-            "horizontalAlignment": "CENTER",
-            "textFormat": {"bold": True}
-        })
-        return True, f"データをシート '{sheet_name} / {worksheet.title}' に正常にエクスポートしました"
-    except Exception as e:
-        return False, f"Google Sheetsへのエクスポートに失敗しました: {str(e)}"
-
-# ------------------------------
 # Streamlit UI処理
 # ------------------------------
 def display_search_result(item):
@@ -296,14 +217,6 @@ def display_loading_animation(num_placeholders=3):
 # Streamlitアプリのメイン部分
 # ------------------------------
 def main():
-    # セッション状態の初期化
-    if 'google_sheets_connected' not in st.session_state:
-        st.session_state.google_sheets_connected = False
-    if 'gc' not in st.session_state:
-        st.session_state.gc = None
-    if 'all_results' not in st.session_state:
-        st.session_state.all_results = []
-        
     # サイドバー
     with st.sidebar:
         st.markdown('<div class="sidebar-header"></div>', unsafe_allow_html=True)
@@ -319,16 +232,44 @@ def main():
             "occ": "関連性順"
         }
         sort = st.selectbox("並び順", list(sort_options.keys()), format_func=lambda x: sort_options[x])
-        max_pages = st.slider("最大取得ページ数", 1, 10, 3)
+        
+        # 検索モード選択（通常 or 無制限）
+        search_mode = st.radio("検索モード", ["通常検索", "無制限検索"], index=0)
+        
+        if search_mode == "通常検索":
+            max_pages = st.slider("最大取得ページ数", 1, 10, 3)
+            st.info("通常検索モードでは、指定したページ数まで結果を取得します。")
+        else:
+            max_pages = float('inf')  # 無限大に設定
+            st.warning("無制限検索モードでは、全ての検索結果を取得します。時間がかかる場合があります。")
+            
+            # 安全策として制限値を設定（UIには表示せず、内部的に使用）
+            safety_limit = st.number_input(
+                "安全制限（ページ数）",
+                min_value=10,
+                max_value=100,
+                value=50,
+                help="システム負荷を考慮した最大ページ数制限",
+                key="safety_limit",
+                label_visibility="collapsed"
+            )
         
         search_button = st.button("検索", use_container_width=True)
         
         st.markdown("---")
-        st.markdown("### エクスポート")
-        # ローカルへのダウンロード機能
+        st.markdown("### About")
+        st.markdown("""
+        このアプリはWatchTower Online Libraryの検索を行います。
+        キーワードを入力し、検索ボタンをクリックしてください。
+        無制限検索モードでは、利用可能な全ての結果を取得します。
+        """)
+        
+        st.markdown("### Export")
+        export_format = st.selectbox("エクスポート形式", ["CSV", "Excel"])
+        
+        # 検索結果がある場合のみエクスポートボタンを表示
         if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
-            export_format = st.selectbox("エクスポート形式", ["CSV", "Excel"])
-            if st.button("検索結果をダウンロード", use_container_width=True):
+            if st.button("検索結果をエクスポート", use_container_width=True):
                 df = pd.DataFrame(st.session_state.all_results)
                 if export_format == "CSV":
                     csv = df.to_csv(index=False).encode('utf-8')
@@ -340,94 +281,78 @@ def main():
                         use_container_width=True
                     )
                 else:
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        df.to_excel(writer, index=False, sheet_name='検索結果')
-                    output.seek(0)
-                    excel_data = output.read()
-                    st.download_button(
-                        label="Excelをダウンロード",
-                        data=excel_data,
-                        file_name=f"search_results_{keyword}_{lang}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-        
-        # Google Sheets連携
-        st.markdown("---")
-        with st.expander("Google Sheets連携", expanded=False):
-            if not st.session_state.google_sheets_connected:
-                st.markdown("### Google Sheetsに接続")
-                st.markdown("""
-                1. Google Cloud Consoleでサービスアカウントを作成  
-                2. サービスアカウントのJSONキーを取得  
-                3. JSONキーの内容を以下に貼り付け
-                """)
-                json_key = st.text_area("サービスアカウントのJSONキー", height=100, 
-                                        placeholder='{  "type": "service_account",  "project_id": "...",  ... }')
-                if st.button("接続", key="connect_google"):
-                    try:
-                        import json
-                        json_key_content = json.loads(json_key)
-                        gc, sheets_api = connect_to_google_sheets(json_key_content)
-                        if gc and sheets_api:
-                            st.session_state.gc = gc
-                            st.session_state.sheets_api = sheets_api
-                            st.session_state.google_sheets_connected = True
-                            st.success("Google Sheetsに正常に接続しました！")
-                    except json.JSONDecodeError:
-                        st.error("JSONキーの形式が正しくありません。正確なJSONを貼り付けてください。")
-                    except Exception as e:
-                        st.error(f"接続エラー: {str(e)}")
-            else:
-                st.success("Google Sheetsに接続済みです")
-                if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
-                    st.markdown("### Google Sheetsにエクスポート")
-                    sheet_name = st.text_input("スプレッドシート名", "JW検索結果")
-                    worksheet_name = st.text_input("ワークシート名", "検索結果")
-                    if st.button("Google Sheetsにエクスポート", key="export_google"):
-                        success, message = export_to_google_sheets(
-                            st.session_state.gc, 
-                            st.session_state.all_results, 
-                            sheet_name, 
-                            worksheet_name
-                        )
-                        if success:
-                            st.success(message)
-                        else:
-                            st.error(message)
-                if st.button("接続を解除", key="disconnect_google"):
-                    st.session_state.gc = None
-                    st.session_state.sheets_api = None
-                    st.session_state.google_sheets_connected = False
-                    st.info("Google Sheetsとの接続を解除しました")
-    
+                    output = pd.ExcelWriter(f"search_results_{keyword}_{lang}.xlsx", engine='xlsxwriter')
+                    df.to_excel(output, index=False, sheet_name='検索結果')
+                    output.save()
+                    st.success("Excelファイルを保存しました。")
+
     # メインコンテンツエリア
     st.title("JW Library Search Tool")
     
+    # 初期表示
+    if 'all_results' not in st.session_state:
+        st.session_state.all_results = []
+    
     # 検索実行
     if search_button and keyword:
-        st.session_state.all_results = []  # 結果リセット
-        st.info(f"キーワード「{keyword}」で検索を開始します...")
+        st.session_state.all_results = []  # 結果をリセット
+        
+        # 検索開始メッセージ
+        if search_mode == "通常検索":
+            st.info(f"キーワード「{keyword}」で最大{max_pages}ページ分の検索を開始します...")
+        else:
+            st.info(f"キーワード「{keyword}」で無制限検索を開始します。すべての結果を取得します...")
+            # 無制限モードの場合は安全制限を適用
+            max_pages = st.session_state.safety_limit
+        
+        # ローディングアニメーション表示
         loading = display_loading_animation()
+        
+        # 検索実行
         page_num = 1
-        total_pages = max_pages
+        total_pages = max_pages  # デフォルト値
+        result_count = 0
+        
+        # 進捗状況表示用
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
         while page_num <= max_pages:
+            # 検索を実行
             page_data = _fetch_and_parse_page(keyword, page_num, lang=lang, sort=sort)
+            
+            # 結果を保存
             st.session_state.all_results.extend(page_data["items"])
+            result_count += len(page_data["items"])
+            
+            # 合計ページ数を更新
             if page_num == 1:
-                total_pages = min(max_pages, page_data["result_info"]["total_pages"])
+                # 無制限モードでは実際の総ページ数を使用
+                if search_mode == "無制限検索":
+                    total_pages = page_data["result_info"]["total_pages"]
+                else:
+                    total_pages = min(max_pages, page_data["result_info"]["total_pages"])
+                    
                 if total_pages == 0:
                     break
-            progress = page_num / total_pages
-            st.progress(progress)
+            
+            # 進捗状況を表示
+            progress = min(page_num / total_pages, 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"ページ {page_num}/{total_pages} を取得中... 現在 {result_count} 件の結果")
+            
+            # 次のページがなければ終了
             if not page_data["has_next"]:
                 break
+                
             page_num += 1
-            time.sleep(0.5)
-        
+            time.sleep(0.5)  # サーバー負荷を考慮
+
+        # ローディングを非表示
         loading.empty()
+        status_text.empty()
+        
+        # 検索結果概要
         if len(st.session_state.all_results) > 0:
             st.success(f"検索完了！ {len(st.session_state.all_results)} 件の結果が見つかりました。")
         else:
@@ -435,12 +360,19 @@ def main():
     
     # 検索結果の表示
     if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
+        # 結果リストをDataFrameに変換
         df = pd.DataFrame(st.session_state.all_results)
+        
+        # タブで表示方法を切り替え
         tab1, tab2 = st.tabs(["カード表示", "テーブル表示"])
+        
         with tab1:
+            # カード表示
             for item in st.session_state.all_results:
                 display_search_result(item)
+        
         with tab2:
+            # テーブル表示
             st.dataframe(
                 df[["title", "publication", "link"]],
                 column_config={
@@ -451,7 +383,7 @@ def main():
                 hide_index=True,
                 use_container_width=True
             )
-    elif not keyword:
+    elif keyword and search_button:
         st.info("検索キーワードを入力し、検索ボタンを押してください。")
 
 if __name__ == "__main__":
