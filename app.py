@@ -4,6 +4,10 @@ from bs4 import BeautifulSoup
 import urllib.parse
 import pandas as pd
 import time
+import io
+import gspread
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # ページ設定
 st.set_page_config(
@@ -69,6 +73,13 @@ st.markdown("""
     }
     .sidebar-header {
         margin-bottom: 30px;
+    }
+    .google-sheet-section {
+        background-color: #f0f7ff;
+        border-radius: 10px;
+        padding: 15px;
+        margin-top: 20px;
+        border-left: 5px solid #4285F4;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -192,6 +203,90 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
         return {"items": [], "has_next": False, "result_info": {"total": 0, "current_page": 1, "total_pages": 1}}
 
 # ------------------------------
+# Google Sheets 連携機能
+# ------------------------------
+def connect_to_google_sheets(json_key_content):
+    """
+    Google SheetsへのAPI接続
+    """
+    try:
+        # 認証情報をJSONから読み込む
+        credentials = service_account.Credentials.from_service_account_info(
+            json_key_content,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+        )
+        
+        # Google Sheets APIクライアントを作成
+        gc = gspread.authorize(credentials)
+        sheets_api = build('sheets', 'v4', credentials=credentials)
+        
+        return gc, sheets_api
+    except Exception as e:
+        st.error(f"Google Sheetsへの接続に失敗しました: {str(e)}")
+        return None, None
+
+def get_or_create_sheet(gc, sheet_name, worksheet_name=None):
+    """
+    指定したシートを取得するか、存在しない場合は新規作成します
+    """
+    try:
+        # シートが存在するか確認
+        try:
+            sh = gc.open(sheet_name)
+        except gspread.exceptions.SpreadsheetNotFound:
+            # シートが存在しない場合は新規作成
+            sh = gc.create(sheet_name)
+            # 作成者に編集権限を付与
+            sh.share(gc.auth.service_account_email, role='writer', perm_type='user')
+        
+        # ワークシートを取得または作成
+        if worksheet_name:
+            try:
+                worksheet = sh.worksheet(worksheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
+        else:
+            worksheet = sh.sheet1
+        
+        return sh, worksheet
+    except Exception as e:
+        st.error(f"シートの取得または作成に失敗しました: {str(e)}")
+        return None, None
+
+def export_to_google_sheets(gc, data, sheet_name, worksheet_name=None):
+    """
+    検索結果をGoogle Sheetsに出力します
+    """
+    try:
+        # シートを取得または作成
+        sh, worksheet = get_or_create_sheet(gc, sheet_name, worksheet_name)
+        if not sh or not worksheet:
+            return False, "シートの準備に失敗しました"
+        
+        # データを整形
+        df = pd.DataFrame(data)
+        headers = df.columns.tolist()
+        values = [headers] + df.values.tolist()
+        
+        # シートをクリアしてデータを書き込み
+        worksheet.clear()
+        worksheet.update(values)
+        
+        # 表示の調整
+        worksheet.format('A1:Z1', {
+            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+            "horizontalAlignment": "CENTER",
+            "textFormat": {"bold": True}
+        })
+        
+        return True, f"データをシート '{sheet_name} / {worksheet.title}' に正常にエクスポートしました"
+    except Exception as e:
+        return False, f"Google Sheetsへのエクスポートに失敗しました: {str(e)}"
+
+# ------------------------------
 # Streamlit UI処理
 # ------------------------------
 def display_search_result(item):
@@ -217,6 +312,14 @@ def display_loading_animation(num_placeholders=3):
 # Streamlitアプリのメイン部分
 # ------------------------------
 def main():
+    # セッション状態の初期化
+    if 'google_sheets_connected' not in st.session_state:
+        st.session_state.google_sheets_connected = False
+    if 'gc' not in st.session_state:
+        st.session_state.gc = None
+    if 'all_results' not in st.session_state:
+        st.session_state.all_results = []
+        
     # サイドバー
     with st.sidebar:
         st.markdown('<div class="sidebar-header"></div>', unsafe_allow_html=True)
@@ -237,19 +340,15 @@ def main():
         search_button = st.button("検索", use_container_width=True)
         
         st.markdown("---")
-        st.markdown("### About")
-        st.markdown("""
-        このアプリはWatchTower Online Libraryの検索を行います。
-        キーワードを入力し、検索ボタンをクリックしてください。
-        """)
+        st.markdown("### エクスポート")
         
-        st.markdown("### Export")
-        export_format = st.selectbox("エクスポート形式", ["CSV", "Excel"])
-        
-        # 検索結果がある場合のみエクスポートボタンを表示
+        # ローカルにダウンロード
         if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
-            if st.button("検索結果をエクスポート", use_container_width=True):
+            export_format = st.selectbox("エクスポート形式", ["CSV", "Excel"])
+            
+            if st.button("検索結果をダウンロード", use_container_width=True):
                 df = pd.DataFrame(st.session_state.all_results)
+                
                 if export_format == "CSV":
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button(
@@ -259,18 +358,83 @@ def main():
                         mime="text/csv",
                         use_container_width=True
                     )
-                else:
-                    output = pd.ExcelWriter(f"search_results_{keyword}_{lang}.xlsx", engine='xlsxwriter')
-                    df.to_excel(output, index=False, sheet_name='検索結果')
-                    output.save()
-                    st.success("Excelファイルを保存しました。")
+                else:  # Excel
+                    # Excelデータをバイナリストリームとして作成
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        df.to_excel(writer, index=False, sheet_name='検索結果')
+                    
+                    # バイナリデータをリセットして読み取り
+                    output.seek(0)
+                    excel_data = output.read()
+                    
+                    # ダウンロードボタン
+                    st.download_button(
+                        label="Excelをダウンロード",
+                        data=excel_data,
+                        file_name=f"search_results_{keyword}_{lang}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+        # Google Sheets連携
+        st.markdown("---")
+        with st.expander("Google Sheets連携", expanded=False):
+            if not st.session_state.google_sheets_connected:
+                st.markdown("### Google Sheetsに接続")
+                st.markdown("""
+                1. Google Cloud Consoleでサービスアカウントを作成
+                2. サービスアカウントのJSONキーを取得
+                3. JSONキーの内容を以下に貼り付け
+                """)
+                json_key = st.text_area("サービスアカウントのJSONキー", height=100, 
+                                     placeholder='{  "type": "service_account",  "project_id": "...",  ... }')
+                
+                if st.button("接続", key="connect_google"):
+                    try:
+                        # JSONの構文チェック
+                        import json
+                        json_key_content = json.loads(json_key)
+                        
+                        # Google Sheetsに接続
+                        gc, sheets_api = connect_to_google_sheets(json_key_content)
+                        if gc and sheets_api:
+                            st.session_state.gc = gc
+                            st.session_state.sheets_api = sheets_api
+                            st.session_state.google_sheets_connected = True
+                            st.success("Google Sheetsに正常に接続しました！")
+                    except json.JSONDecodeError:
+                        st.error("JSONキーの形式が正しくありません。正確なJSONを貼り付けてください。")
+                    except Exception as e:
+                        st.error(f"接続エラー: {str(e)}")
+            else:
+                st.success("Google Sheetsに接続済みです")
+                
+                if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
+                    st.markdown("### Google Sheetsにエクスポート")
+                    sheet_name = st.text_input("スプレッドシート名", "JW検索結果")
+                    worksheet_name = st.text_input("ワークシート名", "検索結果")
+                    
+                    if st.button("Google Sheetsにエクスポート", key="export_google"):
+                        success, message = export_to_google_sheets(
+                            st.session_state.gc, 
+                            st.session_state.all_results, 
+                            sheet_name, 
+                            worksheet_name
+                        )
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
+                
+                if st.button("接続を解除", key="disconnect_google"):
+                    st.session_state.gc = None
+                    st.session_state.sheets_api = None
+                    st.session_state.google_sheets_connected = False
+                    st.info("Google Sheetsとの接続を解除しました")
 
     # メインコンテンツエリア
     st.title("JW Library Search Tool")
-    
-    # 初期表示
-    if 'all_results' not in st.session_state:
-        st.session_state.all_results = []
     
     # 検索実行
     if search_button and keyword:
@@ -344,7 +508,7 @@ def main():
                 hide_index=True,
                 use_container_width=True
             )
-    elif keyword and search_button:
+    elif not keyword:
         st.info("検索キーワードを入力し、検索ボタンを押してください。")
 
 if __name__ == "__main__":
