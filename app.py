@@ -97,7 +97,6 @@ def get_base_url(lang):
         "ja": "https://wol.jw.org/ja/wol/s/r7/lp-j",
         "en": "https://wol.jw.org/en/wol/s/r1/lp-e"
     }
-    # 指定された言語が無い場合は日本語版を返す
     return urls.get(lang, urls["ja"])
 
 # ------------------------------
@@ -136,7 +135,6 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
                 link_tag = caption_li.select_one("a.lnk")
                 if link_tag:
                     title = link_tag.get_text(strip=True)
-                    # 相対パスを絶対URLに変換
                     link = urllib.parse.urljoin(base_url, link_tag.get("href", "").strip())
                 else:
                     title, link = "", ""
@@ -165,7 +163,7 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
             else:
                 title, link, snippet, publication = "", "", "", ""
             
-            if title and link:  # 有効な結果のみ追加
+            if title and link:
                 items.append({
                     "title": title,
                     "link": link,
@@ -173,7 +171,7 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
                     "publication": publication
                 })
         
-        # ページネーション情報の取得（該当要素が無ければ次ページ無しと判断）
+        # ページネーション情報の取得
         try:
             total_str = soup.select_one("#searchResultsTotal")["value"]
             page_size_str = soup.select_one("#searchResultsPageSize")["value"]
@@ -203,14 +201,13 @@ def _fetch_and_parse_page(keyword, page_num, lang="ja", sort="occ"):
         return {"items": [], "has_next": False, "result_info": {"total": 0, "current_page": 1, "total_pages": 1}}
 
 # ------------------------------
-# Google Sheets 連携機能
+# Google Sheets 連携機能（オプション）
 # ------------------------------
 def connect_to_google_sheets(json_key_content):
     """
     Google SheetsへのAPI接続
     """
     try:
-        # 認証情報をJSONから読み込む
         credentials = service_account.Credentials.from_service_account_info(
             json_key_content,
             scopes=[
@@ -218,11 +215,8 @@ def connect_to_google_sheets(json_key_content):
                 "https://www.googleapis.com/auth/drive"
             ]
         )
-        
-        # Google Sheets APIクライアントを作成
         gc = gspread.authorize(credentials)
         sheets_api = build('sheets', 'v4', credentials=credentials)
-        
         return gc, sheets_api
     except Exception as e:
         st.error(f"Google Sheetsへの接続に失敗しました: {str(e)}")
@@ -230,19 +224,15 @@ def connect_to_google_sheets(json_key_content):
 
 def get_or_create_sheet(gc, sheet_name, worksheet_name=None):
     """
-    指定したシートを取得するか、存在しない場合は新規作成します
+    指定したシートを取得または新規作成
     """
     try:
-        # シートが存在するか確認
         try:
             sh = gc.open(sheet_name)
         except gspread.exceptions.SpreadsheetNotFound:
-            # シートが存在しない場合は新規作成
             sh = gc.create(sheet_name)
-            # 作成者に編集権限を付与
             sh.share(gc.auth.service_account_email, role='writer', perm_type='user')
         
-        # ワークシートを取得または作成
         if worksheet_name:
             try:
                 worksheet = sh.worksheet(worksheet_name)
@@ -258,30 +248,24 @@ def get_or_create_sheet(gc, sheet_name, worksheet_name=None):
 
 def export_to_google_sheets(gc, data, sheet_name, worksheet_name=None):
     """
-    検索結果をGoogle Sheetsに出力します
+    検索結果をGoogle Sheetsにエクスポート
     """
     try:
-        # シートを取得または作成
         sh, worksheet = get_or_create_sheet(gc, sheet_name, worksheet_name)
         if not sh or not worksheet:
             return False, "シートの準備に失敗しました"
         
-        # データを整形
         df = pd.DataFrame(data)
         headers = df.columns.tolist()
         values = [headers] + df.values.tolist()
         
-        # シートをクリアしてデータを書き込み
         worksheet.clear()
         worksheet.update(values)
-        
-        # 表示の調整
         worksheet.format('A1:Z1', {
             "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
             "horizontalAlignment": "CENTER",
             "textFormat": {"bold": True}
         })
-        
         return True, f"データをシート '{sheet_name} / {worksheet.title}' に正常にエクスポートしました"
     except Exception as e:
         return False, f"Google Sheetsへのエクスポートに失敗しました: {str(e)}"
@@ -341,14 +325,11 @@ def main():
         
         st.markdown("---")
         st.markdown("### エクスポート")
-        
-        # ローカルにダウンロード
+        # ローカルへのダウンロード機能
         if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
             export_format = st.selectbox("エクスポート形式", ["CSV", "Excel"])
-            
             if st.button("検索結果をダウンロード", use_container_width=True):
                 df = pd.DataFrame(st.session_state.all_results)
-                
                 if export_format == "CSV":
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button(
@@ -358,17 +339,12 @@ def main():
                         mime="text/csv",
                         use_container_width=True
                     )
-                else:  # Excel
-                    # Excelデータをバイナリストリームとして作成
+                else:
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                         df.to_excel(writer, index=False, sheet_name='検索結果')
-                    
-                    # バイナリデータをリセットして読み取り
                     output.seek(0)
                     excel_data = output.read()
-                    
-                    # ダウンロードボタン
                     st.download_button(
                         label="Excelをダウンロード",
                         data=excel_data,
@@ -376,27 +352,23 @@ def main():
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
-
+        
         # Google Sheets連携
         st.markdown("---")
         with st.expander("Google Sheets連携", expanded=False):
             if not st.session_state.google_sheets_connected:
                 st.markdown("### Google Sheetsに接続")
                 st.markdown("""
-                1. Google Cloud Consoleでサービスアカウントを作成
-                2. サービスアカウントのJSONキーを取得
+                1. Google Cloud Consoleでサービスアカウントを作成  
+                2. サービスアカウントのJSONキーを取得  
                 3. JSONキーの内容を以下に貼り付け
                 """)
                 json_key = st.text_area("サービスアカウントのJSONキー", height=100, 
-                                     placeholder='{  "type": "service_account",  "project_id": "...",  ... }')
-                
+                                        placeholder='{  "type": "service_account",  "project_id": "...",  ... }')
                 if st.button("接続", key="connect_google"):
                     try:
-                        # JSONの構文チェック
                         import json
                         json_key_content = json.loads(json_key)
-                        
-                        # Google Sheetsに接続
                         gc, sheets_api = connect_to_google_sheets(json_key_content)
                         if gc and sheets_api:
                             st.session_state.gc = gc
@@ -409,12 +381,10 @@ def main():
                         st.error(f"接続エラー: {str(e)}")
             else:
                 st.success("Google Sheetsに接続済みです")
-                
                 if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
                     st.markdown("### Google Sheetsにエクスポート")
                     sheet_name = st.text_input("スプレッドシート名", "JW検索結果")
                     worksheet_name = st.text_input("ワークシート名", "検索結果")
-                    
                     if st.button("Google Sheetsにエクスポート", key="export_google"):
                         success, message = export_to_google_sheets(
                             st.session_state.gc, 
@@ -426,58 +396,38 @@ def main():
                             st.success(message)
                         else:
                             st.error(message)
-                
                 if st.button("接続を解除", key="disconnect_google"):
                     st.session_state.gc = None
                     st.session_state.sheets_api = None
                     st.session_state.google_sheets_connected = False
                     st.info("Google Sheetsとの接続を解除しました")
-
+    
     # メインコンテンツエリア
     st.title("JW Library Search Tool")
     
     # 検索実行
     if search_button and keyword:
-        st.session_state.all_results = []  # 結果をリセット
-        
-        # 検索開始メッセージ
+        st.session_state.all_results = []  # 結果リセット
         st.info(f"キーワード「{keyword}」で検索を開始します...")
-        
-        # ローディングアニメーション表示
         loading = display_loading_animation()
-        
-        # 検索実行
         page_num = 1
-        total_pages = max_pages  # デフォルト値
+        total_pages = max_pages
         
         while page_num <= max_pages:
-            # 検索を実行
             page_data = _fetch_and_parse_page(keyword, page_num, lang=lang, sort=sort)
-            
-            # 結果を保存
             st.session_state.all_results.extend(page_data["items"])
-            
-            # 合計ページ数を更新
             if page_num == 1:
                 total_pages = min(max_pages, page_data["result_info"]["total_pages"])
                 if total_pages == 0:
                     break
-            
-            # 進捗状況を表示
             progress = page_num / total_pages
             st.progress(progress)
-            
-            # 次のページがなければ終了
             if not page_data["has_next"]:
                 break
-                
             page_num += 1
-            time.sleep(0.5)  # サーバー負荷を考慮
-
-        # ローディングを非表示
-        loading.empty()
+            time.sleep(0.5)
         
-        # 検索結果概要
+        loading.empty()
         if len(st.session_state.all_results) > 0:
             st.success(f"検索完了！ {len(st.session_state.all_results)} 件の結果が見つかりました。")
         else:
@@ -485,19 +435,12 @@ def main():
     
     # 検索結果の表示
     if 'all_results' in st.session_state and len(st.session_state.all_results) > 0:
-        # 結果リストをDataFrameに変換
         df = pd.DataFrame(st.session_state.all_results)
-        
-        # タブで表示方法を切り替え
         tab1, tab2 = st.tabs(["カード表示", "テーブル表示"])
-        
         with tab1:
-            # カード表示
             for item in st.session_state.all_results:
                 display_search_result(item)
-        
         with tab2:
-            # テーブル表示
             st.dataframe(
                 df[["title", "publication", "link"]],
                 column_config={
