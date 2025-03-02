@@ -240,18 +240,16 @@ def main():
             max_pages = st.slider("最大取得ページ数", 1, 10, 3)
             st.info("通常検索モードでは、指定したページ数まで結果を取得します。")
         else:
-            max_pages = float('inf')  # 無限大に設定
-            st.warning("無制限検索モードでは、全ての検索結果を取得します。時間がかかる場合があります。")
+            st.warning("無制限検索モードでは、すべての検索結果を取得するまで処理を続けます。時間がかかる場合があります。")
             
-            # 安全策として制限値を設定（UIには表示せず、内部的に使用）
-            safety_limit = st.number_input(
-                "安全制限（ページ数）",
-                min_value=10,
-                max_value=100,
-                value=50,
-                help="システム負荷を考慮した最大ページ数制限",
-                key="safety_limit",
-                label_visibility="collapsed"
+            # デバッグ用に表示する遅延設定（オプション）
+            request_delay = st.slider(
+                "リクエスト間隔（秒）", 
+                min_value=0.1, 
+                max_value=2.0, 
+                value=0.5, 
+                step=0.1,
+                help="サーバー負荷軽減のためのリクエスト間隔"
             )
         
         search_button = st.button("検索", use_container_width=True)
@@ -302,59 +300,72 @@ def main():
             st.info(f"キーワード「{keyword}」で最大{max_pages}ページ分の検索を開始します...")
         else:
             st.info(f"キーワード「{keyword}」で無制限検索を開始します。すべての結果を取得します...")
-            # 無制限モードの場合は安全制限を適用
-            max_pages = st.session_state.safety_limit
+            # 無制限モードのデフォルト設定
+            max_pages = float('inf')  # 本当に無限に設定
+            delay = request_delay  # リクエスト間隔
         
         # ローディングアニメーション表示
         loading = display_loading_animation()
         
         # 検索実行
         page_num = 1
-        total_pages = max_pages  # デフォルト値
+        total_pages = None  # まだ不明
         result_count = 0
         
         # 進捗状況表示用
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        while page_num <= max_pages:
+        while True:
             # 検索を実行
             page_data = _fetch_and_parse_page(keyword, page_num, lang=lang, sort=sort)
+            
+            # エラーチェック - 取得失敗の場合は終了
+            if not page_data["items"]:
+                if page_num > 1:  # 初回以外はエラーメッセージ表示
+                    st.warning(f"ページ {page_num} の取得に失敗しました。ここまでの結果を表示します。")
+                break
             
             # 結果を保存
             st.session_state.all_results.extend(page_data["items"])
             result_count += len(page_data["items"])
             
-            # 合計ページ数を更新
-            if page_num == 1:
-                # 無制限モードでは実際の総ページ数を使用
-                if search_mode == "無制限検索":
-                    total_pages = page_data["result_info"]["total_pages"]
-                else:
-                    total_pages = min(max_pages, page_data["result_info"]["total_pages"])
-                    
+            # 初回の検索で合計ページ数を取得
+            if total_pages is None:
+                total_pages = page_data["result_info"]["total_pages"]
                 if total_pages == 0:
                     break
+                
+                # 通常検索モードの場合、max_pagesを上限とする
+                if search_mode == "通常検索" and total_pages > max_pages:
+                    total_pages = max_pages
             
             # 進捗状況を表示
-            progress = min(page_num / total_pages, 1.0)
-            progress_bar.progress(progress)
+            progress = page_num / total_pages if total_pages else 0
+            progress_bar.progress(min(progress, 1.0))
             status_text.text(f"ページ {page_num}/{total_pages} を取得中... 現在 {result_count} 件の結果")
             
-            # 次のページがなければ終了
-            if not page_data["has_next"]:
+            # 次のページの有無を確認 または 上限に達したかをチェック
+            if not page_data["has_next"] or page_num >= max_pages:
                 break
                 
             page_num += 1
-            time.sleep(0.5)  # サーバー負荷を考慮
+            
+            # 無制限モードの場合はディレイを適用
+            if search_mode == "無制限検索":
+                time.sleep(delay)
+            else:
+                time.sleep(0.5)  # 通常モードは固定遅延
 
         # ローディングを非表示
         loading.empty()
-        status_text.empty()
         
         # 検索結果概要
         if len(st.session_state.all_results) > 0:
-            st.success(f"検索完了！ {len(st.session_state.all_results)} 件の結果が見つかりました。")
+            if search_mode == "無制限検索" and page_data["has_next"] == False:
+                st.success(f"検索完了！ 全 {len(st.session_state.all_results)} 件の結果を取得しました。")
+            else:
+                st.success(f"検索完了！ {len(st.session_state.all_results)} 件の結果が見つかりました。")
         else:
             st.warning("検索結果が見つかりませんでした。別のキーワードをお試しください。")
     
